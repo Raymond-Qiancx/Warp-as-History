@@ -869,7 +869,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
         image: PipelineImageInput | None = None,
         image_latents: torch.Tensor | None = None,
         fake_image_latents: torch.Tensor | None = None,
-        add_noise_to_image_latents: bool = True,
+        add_noise_to_image_latents: bool = False,
         image_noise_sigma_min: float = 0.111,
         image_noise_sigma_max: float = 0.135,
         # ------------ V2V ------------
@@ -1041,6 +1041,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         # 4. Prepare image or video
+        first_frame_image_latents = None
         if image is not None:
             image = self.video_processor.preprocess(image, height=height, width=width)
             image_latents, fake_image_latents = self.prepare_image_latents(
@@ -1054,6 +1055,9 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 latents=image_latents,
                 fake_latents=fake_image_latents,
             )
+
+        if image_latents is not None:
+            first_frame_image_latents = image_latents
 
         if image_latents is not None and add_noise_to_image_latents:
             image_noise_sigma = (
@@ -1085,6 +1089,9 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                 generator=generator,
                 latents=video_latents,
             )
+
+        if video_latents is not None and image_latents is not None:
+            first_frame_image_latents = image_latents
 
         if video_latents is not None and add_noise_to_video_latents:
             image_noise_sigma = (
@@ -1296,6 +1303,7 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                         attention_kwargs=attention_kwargs,
                         device=device,
                         transformer_dtype=transformer_dtype,
+                        generator=generator,
                         # ------------ CFG Zero ------------
                         use_zero_init=use_zero_init,
                         zero_steps=zero_steps,
@@ -1332,6 +1340,12 @@ class HeliosPipeline(DiffusionPipeline, HeliosLoraLoaderMixin):
                         callback_on_step_end=callback_on_step_end,
                         callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
                         progress_bar=progress_bar,
+                    )
+
+                if keep_first_frame and is_first_chunk and first_frame_image_latents is not None:
+                    latents[:, :, 0:1, :, :] = first_frame_image_latents.to(
+                        device=latents.device,
+                        dtype=latents.dtype,
                     )
 
                 if keep_first_frame and (

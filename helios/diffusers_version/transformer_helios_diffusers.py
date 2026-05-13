@@ -50,6 +50,72 @@ def center_down_sample_3d(x, kernel_size):
     return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 
+def pool_history_visible_mask(mask: torch.Tensor | None, patch_size):
+    if mask is None:
+        return None
+    if mask.ndim == 4:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != 5:
+        raise ValueError(f"history visible mask must be 4D/5D, got {tuple(mask.shape)}")
+    mask = pad_for_3d_conv(mask.float(), patch_size)
+    return torch.nn.functional.avg_pool3d(mask, kernel_size=patch_size, stride=patch_size)
+
+
+def resolve_history_keep_mask(
+    keep_mask: torch.Tensor | None,
+    threshold: float = 0.5,
+):
+    if keep_mask is None:
+        return None
+    if keep_mask.ndim == 5:
+        if keep_mask.shape[1] != 1:
+            raise ValueError(f"history visible mask channel dimension must be 1, got {tuple(keep_mask.shape)}")
+        keep_mask = keep_mask[:, 0]
+    if keep_mask.ndim != 4:
+        raise ValueError(f"history visible mask must reduce to [B,T,H,W], got {tuple(keep_mask.shape)}")
+    keep_flat = keep_mask.flatten(1)
+    if keep_flat.dtype != torch.bool:
+        keep_flat = keep_flat >= float(threshold)
+    if keep_flat.shape[0] == 1:
+        return keep_flat[0]
+    if not torch.equal(keep_flat, keep_flat[0:1].expand_as(keep_flat)):
+        raise ValueError("history visible masking currently requires identical masks across the batch.")
+    return keep_flat[0]
+
+
+def filter_history_tokens_by_mask(
+    hidden_states: torch.Tensor,
+    rotary_emb: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    threshold: float = 0.5,
+):
+    keep = resolve_history_keep_mask(keep_mask, threshold=threshold)
+    if keep is None:
+        return hidden_states, rotary_emb
+    if bool(keep.all()):
+        return hidden_states, rotary_emb
+    if not bool(keep.any()):
+        return hidden_states[:, :0], rotary_emb[:, :0]
+    return hidden_states[:, keep, :], rotary_emb[:, keep, :]
+
+
+def replace_history_tokens_by_mask(
+    hidden_states: torch.Tensor,
+    keep_mask: torch.Tensor | None,
+    invisible_token: torch.Tensor | None,
+    threshold: float = 0.5,
+):
+    keep = resolve_history_keep_mask(keep_mask, threshold=threshold)
+    if keep is None or bool(keep.all()):
+        return hidden_states
+    if invisible_token is None:
+        raise ValueError("history invisible token mode requires transformer.history_invisible_token to be initialized.")
+    replace = (~keep).view(1, -1, 1)
+    token = invisible_token.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    token = token.expand(hidden_states.shape[0], hidden_states.shape[1], -1)
+    return torch.where(replace, token, hidden_states)
+
+
 def apply_rotary_emb_transposed(
     hidden_states: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -137,6 +203,28 @@ class HeliosAttnProcessor:
                 if attn.history_scale_mode == "per_head":
                     scale_key = scale_key.view(1, 1, -1, 1)
                 key = torch.cat([key[:, :history_seq_len] * scale_key, key[:, history_seq_len:]], dim=1)
+
+        history_key_boost_mask = getattr(attn, "history_key_boost_mask", None)
+        history_key_boost_scale = float(getattr(attn, "history_key_boost_scale", 1.0) or 1.0)
+        if (
+            not attn.is_cross_attention
+            and history_key_boost_mask is not None
+            and history_key_boost_scale != 1.0
+        ):
+            boost_mask = history_key_boost_mask.to(device=key.device, dtype=torch.bool)
+            if boost_mask.ndim != 1:
+                raise ValueError(f"history_key_boost_mask must be 1D, got {tuple(boost_mask.shape)}.")
+            if boost_mask.shape[0] != key.shape[1]:
+                raise ValueError(
+                    "history_key_boost_mask length must match self-attention key sequence length, "
+                    f"got mask={boost_mask.shape[0]} key={key.shape[1]}."
+                )
+            if bool(boost_mask.any()):
+                key = torch.where(
+                    boost_mask.view(1, -1, 1, 1),
+                    key * history_key_boost_scale,
+                    key,
+                )
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -336,7 +424,6 @@ class HeliosRotaryPosEmbed(nn.Module):
     def _get_freqs_base(self, dim):
         return 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
 
-    @torch.no_grad()
     def get_frequency_batched(self, freqs_base, pos):
         freqs = torch.einsum("d,bthw->dbthw", freqs_base, pos)
         freqs = freqs.repeat_interleave(2, dim=0)
@@ -369,6 +456,18 @@ class HeliosRotaryPosEmbed(nn.Module):
 
         result = torch.cat([freqs_cos_t, freqs_cos_y, freqs_cos_x, freqs_sin_t, freqs_sin_y, freqs_sin_x], dim=0)
 
+        return result.permute(1, 0, 2, 3, 4)
+
+    def forward_with_positions(self, frame_positions, y_positions, x_positions, device):
+        frame_positions = frame_positions.to(device=device, dtype=torch.float32)
+        y_positions = y_positions.to(device=device, dtype=torch.float32)
+        x_positions = x_positions.to(device=device, dtype=torch.float32)
+
+        freqs_cos_t, freqs_sin_t = self.get_frequency_batched(self.freqs_base_t, frame_positions)
+        freqs_cos_y, freqs_sin_y = self.get_frequency_batched(self.freqs_base_y, y_positions)
+        freqs_cos_x, freqs_sin_x = self.get_frequency_batched(self.freqs_base_x, x_positions)
+
+        result = torch.cat([freqs_cos_t, freqs_cos_y, freqs_cos_x, freqs_sin_t, freqs_sin_y, freqs_sin_x], dim=0)
         return result.permute(1, 0, 2, 3, 4)
 
 
@@ -657,6 +756,74 @@ class HeliosTransformer3DModel(
 
         self.gradient_checkpointing = False
 
+    def enable_target_channel_fusion(self):
+        if getattr(self, "target_channel_fusion_mlp", None) is not None:
+            return
+        self.target_channel_fusion_mlp = nn.Sequential(
+            nn.Linear(self.inner_dim * 2, self.inner_dim),
+            nn.SiLU(),
+            nn.Linear(self.inner_dim, self.inner_dim),
+        )
+        nn.init.xavier_uniform_(self.target_channel_fusion_mlp[0].weight)
+        nn.init.zeros_(self.target_channel_fusion_mlp[0].bias)
+        nn.init.zeros_(self.target_channel_fusion_mlp[2].weight)
+        nn.init.zeros_(self.target_channel_fusion_mlp[2].bias)
+
+    def fuse_target_channel_condition(self, hidden_states, condition_hidden_states):
+        fusion_mlp = getattr(self, "target_channel_fusion_mlp", None)
+        if fusion_mlp is None:
+            raise ValueError("target_channel_fusion_latents were provided before enabling target_channel_fusion_mlp.")
+        if hidden_states.shape != condition_hidden_states.shape:
+            raise ValueError(
+                "target channel fusion expects condition and target patch tokens to have the same shape, "
+                f"got target={tuple(hidden_states.shape)} condition={tuple(condition_hidden_states.shape)}"
+            )
+        fusion_dtype = next(fusion_mlp.parameters()).dtype
+        fusion_input = torch.cat([hidden_states, condition_hidden_states.to(hidden_states)], dim=-1).to(fusion_dtype)
+        fused_delta = fusion_mlp(fusion_input)
+        return hidden_states + fused_delta.to(hidden_states)
+
+    def _maybe_apply_learned_rope_delta(
+        self,
+        rotary_emb: torch.Tensor,
+        frame_indices: torch.Tensor,
+        height: int,
+        width: int,
+        device: torch.device,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        if not attention_kwargs or "learned_rope_delta" not in attention_kwargs:
+            return rotary_emb
+        delta = attention_kwargs["learned_rope_delta"]
+        if delta is None:
+            return rotary_emb
+        delta = delta.to(device=device, dtype=torch.float32)
+        if delta.ndim != 5 or delta.shape[1] != 3 or delta.shape[-3:] != (
+            frame_indices.shape[1],
+            height,
+            width,
+        ):
+            return rotary_emb
+
+        batch_size = frame_indices.shape[0]
+        if delta.shape[0] == 1 and batch_size != 1:
+            delta = delta.expand(batch_size, -1, -1, -1, -1)
+        elif delta.shape[0] != batch_size:
+            return rotary_emb
+
+        grid_y, grid_x = self.rope._get_spatial_meshgrid(height, width, str(device))
+        frame_pos = frame_indices.to(device=device, dtype=torch.float32)[:, :, None, None].expand(
+            batch_size, frame_indices.shape[1], height, width
+        )
+        pos_y = grid_y[None, None, :, :].expand(batch_size, frame_indices.shape[1], -1, -1)
+        pos_x = grid_x[None, None, :, :].expand(batch_size, frame_indices.shape[1], -1, -1)
+        return self.rope.forward_with_positions(
+            frame_pos + delta[:, 0],
+            pos_y + delta[:, 1],
+            pos_x + delta[:, 2],
+            device,
+        )
+
     @apply_lora_scale("attention_kwargs")
     def forward(
         self,
@@ -671,35 +838,83 @@ class HeliosTransformer3DModel(
         latents_history_short=None,
         latents_history_mid=None,
         latents_history_long=None,
+        history_visible_mask_short=None,
+        history_visible_mask_mid=None,
+        history_visible_mask_long=None,
+        target_channel_fusion_latents=None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
+        history_threshold = 0.5
+        history_invisible_token_mode = "none"
+        history_key_boost_mode = "none"
+        history_key_boost_scale = 1.0
+        if attention_kwargs:
+            history_threshold = float(attention_kwargs.get("history_visible_token_threshold", 0.5) or 0.5)
+            history_invisible_token_mode = str(attention_kwargs.get("history_invisible_token_mode", "none") or "none")
+            history_key_boost_mode = str(attention_kwargs.get("history_key_boost_mode", "none") or "none")
+            history_key_boost_scale = float(attention_kwargs.get("history_key_boost_scale", 1.0) or 1.0)
+        history_key_boost_enabled = history_key_boost_mode in {
+            "short_last_latent",
+            "warp_last_latent",
+        } and history_key_boost_scale != 1.0
         # 1. Input
         batch_size = hidden_states.shape[0]
         p_t, p_h, p_w = self.config.patch_size
 
         # 2. Process noisy latents
-        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = self.patch_embedding(
+            hidden_states.to(device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype)
+        )
         _, _, post_patch_num_frames, post_patch_height, post_patch_width = hidden_states.shape
 
         if indices_hidden_states is None:
             indices_hidden_states = torch.arange(0, post_patch_num_frames).unsqueeze(0).expand(batch_size, -1)
 
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if target_channel_fusion_latents is not None:
+            condition_hidden_states = self.patch_embedding(
+                target_channel_fusion_latents.to(
+                    device=self.patch_embedding.weight.device, dtype=self.patch_embedding.weight.dtype
+                )
+            )
+            condition_hidden_states = condition_hidden_states.flatten(2).transpose(1, 2)
+            hidden_states = self.fuse_target_channel_condition(hidden_states, condition_hidden_states)
         rotary_emb = self.rope(
             frame_indices=indices_hidden_states,
             height=post_patch_height,
             width=post_patch_width,
             device=hidden_states.device,
         )
+        rotary_emb = self._maybe_apply_learned_rope_delta(
+            rotary_emb,
+            indices_hidden_states,
+            post_patch_height,
+            post_patch_width,
+            hidden_states.device,
+            attention_kwargs,
+        )
         rotary_emb = rotary_emb.flatten(2).transpose(1, 2)
         original_context_length = hidden_states.shape[1]
+        history_key_boost_mask = torch.zeros(original_context_length, device=hidden_states.device, dtype=torch.bool)
 
         # 3. Process short history latents
         if latents_history_short is not None and indices_latents_history_short is not None:
             latents_history_short = latents_history_short.to(hidden_states)
             latents_history_short = self.patch_short(latents_history_short)
             _, _, _, H1, W1 = latents_history_short.shape
+            boost_mask_short = None
+            if history_key_boost_enabled:
+                _, _, T1, _, _ = latents_history_short.shape
+                boost_mask_short = torch.zeros(
+                    T1,
+                    H1,
+                    W1,
+                    device=latents_history_short.device,
+                    dtype=torch.bool,
+                )
+                boost_mask_short[-1] = True
+                boost_mask_short = boost_mask_short.flatten()
             latents_history_short = latents_history_short.flatten(2).transpose(1, 2)
 
             rotary_emb_history_short = self.rope(
@@ -709,9 +924,38 @@ class HeliosTransformer3DModel(
                 device=latents_history_short.device,
             )
             rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
+            keep_mask_short = pool_history_visible_mask(history_visible_mask_short, (1, 2, 2))
+            if boost_mask_short is not None:
+                keep_short = resolve_history_keep_mask(keep_mask_short, threshold=history_threshold)
+                if keep_short is not None:
+                    boost_mask_short = boost_mask_short[keep_short.to(device=boost_mask_short.device)]
+            if history_invisible_token_mode == "global":
+                latents_history_short = replace_history_tokens_by_mask(
+                    latents_history_short,
+                    keep_mask_short,
+                    getattr(self, "history_invisible_token", None),
+                    threshold=history_threshold,
+                )
+            else:
+                latents_history_short, rotary_emb_history_short = filter_history_tokens_by_mask(
+                    latents_history_short,
+                    rotary_emb_history_short,
+                    keep_mask_short,
+                    threshold=history_threshold,
+                )
 
             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
+            if boost_mask_short is None:
+                boost_mask_short = torch.zeros(
+                    latents_history_short.shape[1],
+                    device=history_key_boost_mask.device,
+                    dtype=torch.bool,
+                )
+            history_key_boost_mask = torch.cat(
+                [boost_mask_short.to(device=history_key_boost_mask.device), history_key_boost_mask],
+                dim=0,
+            )
 
         # 4. Process mid history latents
         if latents_history_mid is not None and indices_latents_history_mid is not None:
@@ -729,9 +973,35 @@ class HeliosTransformer3DModel(
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = center_down_sample_3d(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = rotary_emb_history_mid.flatten(2).transpose(1, 2)
+            keep_mask_mid = pool_history_visible_mask(history_visible_mask_mid, (2, 4, 4))
+            if history_invisible_token_mode == "global":
+                latents_history_mid = replace_history_tokens_by_mask(
+                    latents_history_mid,
+                    keep_mask_mid,
+                    getattr(self, "history_invisible_token", None),
+                    threshold=history_threshold,
+                )
+            else:
+                latents_history_mid, rotary_emb_history_mid = filter_history_tokens_by_mask(
+                    latents_history_mid,
+                    rotary_emb_history_mid,
+                    keep_mask_mid,
+                    threshold=history_threshold,
+                )
 
             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
+            history_key_boost_mask = torch.cat(
+                [
+                    torch.zeros(
+                        latents_history_mid.shape[1],
+                        device=history_key_boost_mask.device,
+                        dtype=torch.bool,
+                    ),
+                    history_key_boost_mask,
+                ],
+                dim=0,
+            )
 
         # 5. Process long history latents
         if latents_history_long is not None and indices_latents_history_long is not None:
@@ -749,9 +1019,35 @@ class HeliosTransformer3DModel(
             rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = center_down_sample_3d(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = rotary_emb_history_long.flatten(2).transpose(1, 2)
+            keep_mask_long = pool_history_visible_mask(history_visible_mask_long, (4, 8, 8))
+            if history_invisible_token_mode == "global":
+                latents_history_long = replace_history_tokens_by_mask(
+                    latents_history_long,
+                    keep_mask_long,
+                    getattr(self, "history_invisible_token", None),
+                    threshold=history_threshold,
+                )
+            else:
+                latents_history_long, rotary_emb_history_long = filter_history_tokens_by_mask(
+                    latents_history_long,
+                    rotary_emb_history_long,
+                    keep_mask_long,
+                    threshold=history_threshold,
+                )
 
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_long, rotary_emb], dim=1)
+            history_key_boost_mask = torch.cat(
+                [
+                    torch.zeros(
+                        latents_history_long.shape[1],
+                        device=history_key_boost_mask.device,
+                        dtype=torch.bool,
+                    ),
+                    history_key_boost_mask,
+                ],
+                dim=0,
+            )
 
         history_context_length = hidden_states.shape[1] - original_context_length
 
@@ -788,6 +1084,14 @@ class HeliosTransformer3DModel(
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
+        if history_key_boost_enabled and bool(history_key_boost_mask.any()):
+            for block in self.blocks:
+                block.attn1.history_key_boost_mask = history_key_boost_mask
+                block.attn1.history_key_boost_scale = float(history_key_boost_scale)
+        else:
+            for block in self.blocks:
+                block.attn1.history_key_boost_mask = None
+                block.attn1.history_key_boost_scale = 1.0
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
