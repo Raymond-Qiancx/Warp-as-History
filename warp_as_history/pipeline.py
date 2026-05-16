@@ -802,7 +802,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
             self._wah_loaded_lora_path = lora_path
 
         if hasattr(self, "set_adapters"):
-            self.set_adapters([self._wah_adapter_name], adapter_weights=[1.0])
+            try:
+                self.set_adapters([self._wah_adapter_name], adapter_weights=[1.0])
+            except KeyError:
+                # Diffusers does not know how to expand scalar adapter weights for
+                # custom transformer classes; a freshly loaded single adapter is
+                # already active at its default scale.
+                pass
         self._set_wah_lora_enabled(True)
         return True
 
